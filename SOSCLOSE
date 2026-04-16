@@ -77,6 +77,7 @@ DO_CLOSE_VISIBLE_APPS=0
 DO_CLOSE_DEV_APPS=0
 DO_STOP_PORTS=0
 DO_STOP_PROCS=0
+PERMISSION_WARNED=0
 
 pick_log_file() {
   local candidate=""
@@ -112,6 +113,15 @@ log() {
 die() {
   log "ERROR" "$*"
   exit 1
+}
+
+warn_permissions_once() {
+  if (( PERMISSION_WARNED )); then
+    return 0
+  fi
+
+  PERMISSION_WARNED=1
+  log "WARN" "macOS may be blocking app control. If apps are not closing, allow your terminal in System Settings > Privacy & Security > Automation and Accessibility."
 }
 
 trim() {
@@ -163,7 +173,7 @@ array_contains_ci() {
 
 is_app_running() {
   local app="$1"
-  pgrep -ix "$app" >/dev/null 2>&1
+  get_app_pids "$app" >/dev/null
 }
 
 is_protected_app() {
@@ -230,7 +240,60 @@ request_app_quit() {
     return 0
   fi
 
-  osascript -e "tell application \"${escaped}\" to quit" >/dev/null 2>&1
+  local output=""
+  output="$(osascript -e "tell application \"${escaped}\" to quit" 2>&1)"
+  if [[ $? -ne 0 ]]; then
+    log "WARN" "AppleScript quit failed for ${app}: ${output}"
+    warn_permissions_once
+    return 1
+  fi
+
+  return 0
+}
+
+get_app_pids() {
+  local app="$1"
+  local canon
+  canon="$(normalise_app_name "$app")"
+
+  local pids=""
+  pids="$(pgrep -ix "$canon" 2>/dev/null)"
+  if [[ -n "$pids" ]]; then
+    print -r -- "$pids"
+    return 0
+  fi
+
+  local escaped
+  escaped="$(escape_applescript_string "$canon")"
+
+  pids="$(osascript <<APPLESCRIPT 2>/dev/null
+tell application "System Events"
+  try
+    set pidList to unix id of every application process whose name is "${escaped}"
+    if (count of pidList) is 0 then
+      return ""
+    end if
+    return pidList as string
+  on error
+    return ""
+  end try
+end tell
+APPLESCRIPT
+)"
+
+  if [[ -n "$pids" ]]; then
+    pids="${pids//,/ }"
+    print -r -- "$pids"
+    return 0
+  fi
+
+  pids="$(pgrep -if "/${canon// /.*}\.app/" 2>/dev/null)"
+  if [[ -n "$pids" ]]; then
+    print -r -- "$pids"
+    return 0
+  fi
+
+  return 1
 }
 
 close_app_staged() {
@@ -252,38 +315,127 @@ close_app_staged() {
   sleep "$QUIT_GRACE"
 
   local pids
-  pids="$(pgrep -ix "$canon" 2>/dev/null)"
+  pids="$(get_app_pids "$canon" 2>/dev/null)"
   if [[ -n "$pids" ]]; then
     local pid
-    for pid in ${(f)pids}; do
+    for pid in ${(ps: :)pids}; do
       staged_kill_pid "$pid" "$canon"
     done
   fi
 }
 
+close_apps_batch() {
+  local requested_apps=("$@")
+  local target_apps=()
+  local app
+
+  for app in "${requested_apps[@]}"; do
+    app="$(normalise_app_name "$app")"
+    [[ -z "$app" ]] && continue
+
+    if is_protected_app "$app"; then
+      log "SKIP" "Protected/kept app: ${app}"
+      continue
+    fi
+
+    if ! is_app_running "$app"; then
+      continue
+    fi
+
+    target_apps+=("$app")
+  done
+
+  if (( ${#target_apps[@]} == 0 )); then
+    return 0
+  fi
+
+  for app in "${target_apps[@]}"; do
+    log "QUIT" "Requesting quit: ${app}"
+    request_app_quit "$app"
+  done
+
+  sleep "$QUIT_GRACE"
+
+  for app in "${target_apps[@]}"; do
+    local pids
+    pids="$(get_app_pids "$app" 2>/dev/null)"
+    [[ -z "$pids" ]] && continue
+
+    local pid
+    for pid in ${(ps: :)pids}; do
+      staged_kill_pid "$pid" "$app"
+    done
+  done
+}
+
+join_apps_csv() {
+  local app
+  local out=""
+
+  for app in "$@"; do
+    [[ -z "$app" ]] && continue
+    if [[ -n "$out" ]]; then
+      out+=","
+    fi
+    out+="$app"
+  done
+
+  print -r -- "$out"
+}
+
 get_visible_gui_apps_csv() {
-  osascript <<'APPLESCRIPT'
+  local output=""
+  output="$(osascript <<'APPLESCRIPT' 2>&1
 tell application "System Events"
-  set appList to name of every application process whose background only is false
-  return appList as string
+  set appList to {}
+  repeat with procRef in (every application process whose background only is false)
+    try
+      set end of appList to (name of procRef) as text
+    end try
+  end repeat
+  return appList
 end tell
 APPLESCRIPT
+)"
+  if [[ $? -ne 0 ]]; then
+    log "WARN" "Could not query visible apps via System Events: ${output}"
+    warn_permissions_once
+    return 1
+  fi
+
+  local apps=()
+  local line=""
+
+  while IFS= read -r line; do
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    apps+=("$line")
+  done <<< "$output"
+
+  if (( ${#apps[@]} == 0 )); then
+    return 0
+  fi
+
+  join_apps_csv "${apps[@]}"
 }
 
 close_visible_gui_apps() {
   local csv
   csv="$(get_visible_gui_apps_csv 2>/dev/null)"
   if [[ -z "$csv" ]]; then
-    log "WARN" "Could not query visible apps (System Events)."
+    log "WARN" "No visible GUI apps were returned by System Events."
     return 0
   fi
 
+  local apps=()
   local app
   for app in ${(s:,:)csv}; do
     app="$(trim "$app")"
     [[ -z "$app" ]] && continue
-    close_app_staged "$app"
+    apps+=("$app")
   done
+
+  close_apps_batch "${apps[@]}"
 }
 
 close_finder_windows() {
@@ -292,7 +444,14 @@ close_finder_windows() {
     return 0
   fi
 
-  osascript -e 'tell application "Finder" to close every window' >/dev/null 2>&1
+  local output=""
+  output="$(osascript -e 'tell application "Finder" to close every window' 2>&1)"
+  if [[ $? -ne 0 ]]; then
+    log "WARN" "Could not close Finder windows: ${output}"
+    warn_permissions_once
+    return 1
+  fi
+
   log "INFO" "Closed Finder windows (best effort)"
 }
 
@@ -324,7 +483,14 @@ minimise_app_windows_best_effort() {
     return 0
   fi
 
-  osascript -e "tell application \"System Events\" to tell process \"${escaped}\" to set value of attribute \"AXMinimized\" of every window to true" >/dev/null 2>&1
+  local output=""
+  output="$(osascript -e "tell application \"System Events\" to tell process \"${escaped}\" to set value of attribute \"AXMinimized\" of every window to true" 2>&1)"
+  if [[ $? -ne 0 ]]; then
+    log "WARN" "Could not minimise windows for ${app}: ${output}"
+    warn_permissions_once
+    return 1
+  fi
+
   log "INFO" "Attempted to minimise windows (best effort): ${app}"
 }
 
@@ -594,10 +760,7 @@ run_mode() {
   fi
 
   if (( DO_CLOSE_DEV_APPS )); then
-    local devapp
-    for devapp in "${DEV_APPS[@]}"; do
-      close_app_staged "$devapp"
-    done
+    close_apps_batch "${DEV_APPS[@]}"
   fi
 
   if (( DO_CLOSE_VISIBLE_APPS )); then
